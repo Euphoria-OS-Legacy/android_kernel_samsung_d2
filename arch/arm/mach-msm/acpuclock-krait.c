@@ -39,6 +39,14 @@
 #include "acpuclock-krait.h"
 #include "avs.h"
 
+<<<<<<< HEAD
+=======
+#define FREQ_TABLE_SIZE 40
+#define MIN_VDD   (600000)
+#define VMIN_VDD (1150000)
+#define MAX_VDD  (1400000)
+
+>>>>>>> 047286e... acpuclock: Add underclock steps down to 54 MHz
 /* MUX source selects. */
 #define PRI_SRC_SEL_SEC_SRC	0
 #define PRI_SRC_SEL_HFPLL	1
@@ -528,9 +536,20 @@ static int acpuclk_krait_set_rate(int cpu, unsigned long rate,
 
 	/* Increase VDD levels if needed. */
 	if (reason == SETRATE_CPUFREQ || reason == SETRATE_HOTPLUG) {
+		/* During HFPLL reprogramming, we'll briefly switch to PLL8.
+		 * In the case where we're switching from one slower-than-PLL8
+		 * frequency to another, we'll be running at an increased
+		 * frequency during this time, and need to guarantee that we're
+		 * running at a suitable voltage during this period.
+		 */
+		unsigned int old_vdd = vdd_data.vdd_core;
+		if (vdd_data.vdd_core < drv.scalable[cpu].nom_min_vdd)
+			vdd_data.vdd_core = drv.scalable[cpu].nom_min_vdd;
+
 		rc = increase_vdd(cpu, &vdd_data, reason);
 		if (rc)
 			goto out;
+		vdd_data.vdd_core = old_vdd;
 
 		prev_l2_src =
 			drv.l2_freq_tbl[drv.scalable[cpu].l2_vote].speed.src;
@@ -798,7 +817,7 @@ static int __cpuinit init_clock_sources(struct scalable *sc,
 
 	/* Set PRI_SRC_SEL_HFPLL_DIV2 divider to div-2. */
 	regval = get_l2_indirect_reg(sc->l2cpmr_iaddr);
-	regval &= ~(0x3 << 6);
+	regval &= ~(0x3 << 6); // 0x2 -> div-4; needs higher voltage
 	set_l2_indirect_reg(sc->l2cpmr_iaddr, regval);
 
 	/* Enable and switch to the target clock source. */
@@ -1216,6 +1235,255 @@ static void __init hw_init(void)
 	bus_init(l2_level);
 }
 
+<<<<<<< HEAD
+=======
+/* UV Stuff */
+static void acpuclk_update_nom_min(void) {
+	struct acpu_level *l;
+	for (l = drv.acpu_freq_tbl; l->speed.khz; l++) {
+		if (l->speed.src != HFPLL) {
+			drv.scalable[0].nom_min_vdd =
+			drv.scalable[1].nom_min_vdd =
+				l->vdd_core;
+			printk(KERN_DEBUG "%s: new nominal vdd is %u\n",
+				__func__, l->vdd_core);
+			break;
+		}
+	}
+}
+static int acpuclk_update_vdd_table(int num, unsigned int table[]) {
+        int i, dir;
+        struct acpu_level *tgt;
+        if (table[0] < table[num-1]) {
+                i = 0;
+                dir = 1;
+        } else {
+                i = num - 1;
+                dir = -1;
+        }
+
+	for (tgt = drv.acpu_freq_tbl; tgt->vdd_core; tgt++) {
+		if (i < 0 || i > num)
+			return 1;
+                tgt->vdd_core = table[i];
+                i += dir;
+        }
+	return 0;
+}
+static int acpuclk_update_one_vdd(unsigned int freq, unsigned int uv) {
+	struct acpu_level *tgt = drv.acpu_freq_tbl;
+	for (; tgt->speed.khz; tgt++) {
+		if (tgt->speed.khz == freq) {
+			tgt->vdd_core = uv;
+			return 0;
+		}
+	}
+	return -EINVAL;
+}
+static int acpuclk_update_all_vdd(int adj) {
+	struct acpu_level *tgt = drv.acpu_freq_tbl;
+	for (; tgt->speed.khz; tgt++) {
+		tgt->vdd_core += adj;
+	}
+	return 0;
+}
+#define sanity_check(v) \
+	if (v < 10000) \
+		v = (v * 1000) + ((v % 5 == 2) ? 500 : 0); \
+	if (v > MAX_VDD || v < MIN_VDD) \
+		return -EINVAL;
+/* My kingdom for a regular expression! */
+static ssize_t _acpuclk_store_vdd_table(const char *buf, size_t count) {
+	unsigned int freq, volt;
+	int adjust, ret, idx, len, thislen;
+	char mhz_label[5], mv_label[3];
+	unsigned int table[FREQ_TABLE_SIZE];
+
+	/* "[+-]mv" adjustments, also understands uv
+	* "echo -75" makes for simple initscripts
+	*/
+	ret = sscanf(buf, "- %i", &adjust);
+	if (ret == 1) {
+		if (adjust < 1000)
+			adjust *= 1000;
+		adjust = -adjust;
+	} else {
+		ret = sscanf(buf, "+ %i", &adjust);
+		if (ret == 1 && adjust < 1000)
+			adjust *= 1000;
+	}
+	if (ret == 1) {
+		if (!acpuclk_update_all_vdd(adjust))
+			return count;
+		else
+			return -EINVAL;
+	}
+
+	thislen = 0;
+	/* Kernel Tuner uses bare values */
+	ret = sscanf(buf, "%u %u%n", &freq, &volt, &thislen);
+	if (thislen < count - 1) {
+		/* "num(mhz)?: uv([um]v)?" adjustments
+		* This allows tables to be saved & restored with cat
+		*/
+		ret = sscanf(buf, "%u %4s %u%n %2s%n", &freq, &mhz_label[0],
+			&volt, &thislen, &mv_label[0], &thislen);
+		if (thislen == count - 1) {
+			for (idx = 0; idx < 4 && mhz_label[idx] != ':'; idx++);
+			if (mhz_label[idx] != ':') thislen = 0;
+		}
+	}
+	if (thislen == count - 1) {
+		while (freq < 10000) freq *= 1000;
+		sanity_check(volt);
+		if (!acpuclk_update_one_vdd(freq, volt))
+			return count;
+		else
+			return -EINVAL;
+	}
+
+	/* table adjustments */
+	for (idx = 0, len = 0; idx < FREQ_TABLE_SIZE && len < count - 1; idx++) {
+		ret = sscanf(buf + len, " %u%n", &table[idx], &thislen);
+		if (!ret) break;
+		len += thislen;
+		sanity_check(table[idx]);
+	}
+	// skip trailing whitespace for voltage control
+	while (buf[len] == ' ') len++;
+	if (idx == (FREQ_TABLE_SIZE - 1) && len == (count - 1)) {
+		if (!acpuclk_update_vdd_table(idx, table))
+			return count;
+		else
+			return -EINVAL;
+	}
+
+	printk(KERN_DEBUG "acpuclk: don't know what this is:\n");
+	printk(KERN_DEBUG "acpuclk: %s\n", buf);
+	return -EINVAL;
+}
+ssize_t acpuclk_store_vdd_table(const char *buf, size_t count) {
+	ssize_t ret = _acpuclk_store_vdd_table(buf, count);
+	acpuclk_update_nom_min();
+	return ret;
+}
+ssize_t acpuclk_show_vdd_table(char *buf, char *fmt, int dir, int fdiv, int vdiv) {
+	int len = 0;
+	int i;
+	if (dir < 0) {
+		i = FREQ_TABLE_SIZE - 2;
+		dir = -1;
+	} else {
+		i = 0;
+		dir = 1;
+	}
+
+	while (i >= 0 && i < FREQ_TABLE_SIZE - 1) {
+		struct acpu_level tgt = drv.acpu_freq_tbl[i];
+		len += sprintf(buf + len, fmt,
+			tgt.speed.khz / fdiv, tgt.vdd_core / vdiv);
+		i += dir;
+	}
+	return len;
+}
+
+/* Global UV interface */
+static ssize_t show_vdd_levels(struct kobject *kobj,
+		struct attribute *attr, char *buf) {
+	return acpuclk_show_vdd_table(buf, "%8u: %8u\n", 1, 1, 1);
+}
+static ssize_t store_vdd_levels(struct kobject *kobj, struct attribute *attr,
+		const char *buf, size_t count) {
+	return acpuclk_store_vdd_table(buf, count);
+}
+static struct global_attr vdd_levels_attr = __ATTR(vdd_levels, 0644,
+		show_vdd_levels, store_vdd_levels);
+static struct attribute *vdd_attributes[] = {
+	&vdd_levels_attr.attr,
+	NULL
+};
+static struct attribute_group vdd_attr_group = {
+	.attrs = vdd_attributes,
+	.name = "vdd_table",
+};
+
+/* Enable OC frequencies.  Also bump max voltage & bus speed. */
+void acpuclk_enable_oc_freqs(unsigned int freq) {
+	struct acpu_level *tgt = drv.acpu_freq_tbl;
+
+	drv.scalable[CPU0].vreg[VREG_CORE].max_vdd = MAX_VDD;
+	drv.scalable[CPU1].vreg[VREG_CORE].max_vdd = MAX_VDD;
+
+	for (; tgt->speed.khz; tgt++) {
+		if (tgt->speed.khz > 1512000)
+			tgt->use_for_scaling = tgt->speed.khz <= freq ? 1 : 0;
+	}
+	tgt--;
+	drv.l2_freq_tbl[tgt->l2_level].bw_level = 7;
+
+	cpufreq_table_init(0);
+}
+
+void acpuclk_set_override_vmin(int enable) {
+	if (enable) {
+		final_vmin = krait_needs_vmin() ?
+			VMIN_VDD : MIN_VDD;
+	} else {
+		final_vmin = MIN_VDD;
+	}
+}
+int acpuclk_get_override_vmin(void) {
+	return final_vmin >= VMIN_VDD;
+}
+
+static ssize_t store_vmin(struct kobject *kobj, struct attribute *attr,
+		const char *buf, size_t count) {
+	unsigned int temp;
+	if (sscanf(buf, "%u", &temp) == 1) {
+		if (temp >= 700 && temp <= 1400) {
+			final_vmin = temp * 1000;
+			return count;
+		}
+	}
+	return -EINVAL;
+}
+static ssize_t show_vmin(struct kobject *kobj,
+		struct attribute *attr, char *buf) {
+	return sprintf(buf, "%u\n", final_vmin / 1000);
+}
+static struct global_attr vmin_attr = __ATTR(vmin, 0666,
+		show_vmin, store_vmin);
+static struct attribute *dkp_attributes[] = {
+	&vmin_attr.attr,
+	NULL
+};
+static struct attribute_group dkp_attr_group = {
+	.attrs = dkp_attributes,
+	.name = "dkp",
+};
+
+/* Full frequency table helper for cpufreq.  Creates a new table that must be
+ * kfree()'d by caller.
+ */
+struct cpufreq_frequency_table *acpuclk_get_full_freq_table(unsigned int cpu) {
+	struct cpufreq_frequency_table *tbl;
+	int i, freq_cnt = 0;
+
+	tbl = kmalloc(FREQ_TABLE_SIZE * sizeof(struct cpufreq_frequency_table), GFP_KERNEL);
+	if (!tbl) return 0;
+
+	for (i = 0; drv.acpu_freq_tbl[i].speed.khz != 0; i++) {
+		tbl[freq_cnt].index = freq_cnt;
+		tbl[freq_cnt].frequency = drv.acpu_freq_tbl[i].speed.khz;
+		freq_cnt++;
+	}
+	tbl[freq_cnt].index = freq_cnt;
+	tbl[freq_cnt].frequency = CPUFREQ_TABLE_END;
+
+	return tbl;
+}
+
+>>>>>>> 047286e... acpuclock: Add underclock steps down to 54 MHz
 int __init acpuclk_krait_init(struct device *dev,
 			      const struct acpuclk_krait_params *params)
 {
@@ -1226,6 +1494,7 @@ int __init acpuclk_krait_init(struct device *dev,
 	dcvs_freq_init();
 	acpuclk_register(&acpuclk_krait_data);
 	register_hotcpu_notifier(&acpuclk_cpu_notifier);
+	acpuclk_update_nom_min();
 
 	return 0;
 }
