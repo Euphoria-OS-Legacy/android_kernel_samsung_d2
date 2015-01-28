@@ -528,9 +528,20 @@ static int acpuclk_krait_set_rate(int cpu, unsigned long rate,
 
 	/* Increase VDD levels if needed. */
 	if (reason == SETRATE_CPUFREQ || reason == SETRATE_HOTPLUG) {
+		/* During HFPLL reprogramming, we'll briefly switch to PLL8.
+		 * In the case where we're switching from one slower-than-PLL8
+		 * frequency to another, we'll be running at an increased
+		 * frequency during this time, and need to guarantee that we're
+		 * running at a suitable voltage during this period.
+		 */
+		unsigned int old_vdd = vdd_data.vdd_core;
+		if (vdd_data.vdd_core < drv.scalable[cpu].nom_min_vdd)
+			vdd_data.vdd_core = drv.scalable[cpu].nom_min_vdd;
+
 		rc = increase_vdd(cpu, &vdd_data, reason);
 		if (rc)
 			goto out;
+		vdd_data.vdd_core = old_vdd;
 
 		prev_l2_src =
 			drv.l2_freq_tbl[drv.scalable[cpu].l2_vote].speed.src;
@@ -798,7 +809,7 @@ static int __cpuinit init_clock_sources(struct scalable *sc,
 
 	/* Set PRI_SRC_SEL_HFPLL_DIV2 divider to div-2. */
 	regval = get_l2_indirect_reg(sc->l2cpmr_iaddr);
-	regval &= ~(0x3 << 6);
+	regval &= ~(0x3 << 6); // 0x2 -> div-4; needs higher voltage
 	set_l2_indirect_reg(sc->l2cpmr_iaddr, regval);
 
 	/* Enable and switch to the target clock source. */
@@ -1216,6 +1227,22 @@ static void __init hw_init(void)
 	bus_init(l2_level);
 }
 
+
+/* UV Stuff */
+static void acpuclk_update_nom_min(void) {
+	struct acpu_level *l;
+	for (l = drv.acpu_freq_tbl; l->speed.khz; l++) {
+		if (l->speed.src != HFPLL) {
+			drv.scalable[0].nom_min_vdd =
+			drv.scalable[1].nom_min_vdd =
+				l->vdd_core;
+			printk(KERN_DEBUG "%s: new nominal vdd is %u\n",
+				__func__, l->vdd_core);
+			break;
+		}
+	}
+}
+
 int __init acpuclk_krait_init(struct device *dev,
 			      const struct acpuclk_krait_params *params)
 {
@@ -1226,6 +1253,7 @@ int __init acpuclk_krait_init(struct device *dev,
 	dcvs_freq_init();
 	acpuclk_register(&acpuclk_krait_data);
 	register_hotcpu_notifier(&acpuclk_cpu_notifier);
+	acpuclk_update_nom_min();
 
 	return 0;
 }
